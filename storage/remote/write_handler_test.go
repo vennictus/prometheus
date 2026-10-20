@@ -31,6 +31,7 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/google/go-cmp/cmp"
 	remoteapi "github.com/prometheus/client_golang/exp/api/remote"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
 
@@ -2264,4 +2265,105 @@ func TestTimeLimitAppenderV2_LimitExemplars(t *testing.T) {
 		require.Len(t, appendable.exemplars, 1)
 		require.Equal(t, int64(900), appendable.exemplars[0].t)
 	})
+}
+
+func TestWriteHandlerV2TypeAndUnitFallbackFromLabels(t *testing.T) {
+	for _, enableTypeAndUnitLabels := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enableTypeAndUnitLabels=%v", enableTypeAndUnitLabels), func(t *testing.T) {
+			appendable := &mockAppendable{
+				latestSample:    map[uint64]int64{},
+				latestExemplar:  map[uint64]int64{},
+				latestHistogram: map[uint64]int64{},
+				latestFloatHist: map[uint64]int64{},
+			}
+			handler := NewWriteHandler(
+				promslog.NewNopLogger(),
+				nil,
+				appendable,
+				[]remoteapi.WriteMessageType{remoteapi.WriteV2MessageType},
+				enableTypeAndUnitLabels,
+				true,
+			)
+
+			// Series 1: __type__ and __unit__ in LabelsRefs, while Metadata struct only has HelpRef (fallback from labels).
+			// Series 2: Metadata struct has Type=GAUGE and Unit="seconds", overriding conflicting __type__="counter" and __unit__="requests" in LabelsRefs.
+			// Series 3: LabelsRefs has unrecognized __type__="invalid_type" and Metadata has METRIC_TYPE_UNSPECIFIED; __type__ must be normalized to unknown and stripped from labels.
+			symbols := []string{
+				"",                    // 0
+				"__name__",            // 1
+				"http_requests_total", // 2
+				"__type__",            // 3
+				"counter",             // 4
+				"__unit__",            // 5
+				"requests",            // 6
+				"job",                 // 7
+				"api",                 // 8
+				"Total HTTP requests", // 9
+				"latency_seconds",     // 10
+				"seconds",             // 11
+				"Latency help",        // 12
+				"untyped_metric",      // 13
+				"invalid_type",        // 14
+			}
+			ts := []writev2.TimeSeries{
+				{
+					LabelsRefs: []uint32{1, 2, 3, 4, 5, 6, 7, 8},
+					Metadata: writev2.Metadata{
+						Type:    writev2.Metadata_METRIC_TYPE_UNSPECIFIED,
+						HelpRef: 9,
+					},
+					Samples: []writev2.Sample{{Timestamp: 1000, Value: 42}},
+				},
+				{
+					LabelsRefs: []uint32{1, 10, 3, 4, 5, 6, 7, 8},
+					Metadata: writev2.Metadata{
+						Type:    writev2.Metadata_METRIC_TYPE_GAUGE,
+						UnitRef: 11,
+						HelpRef: 12,
+					},
+					Samples: []writev2.Sample{{Timestamp: 1000, Value: 1.5}},
+				},
+				{
+					LabelsRefs: []uint32{1, 13, 3, 14, 7, 8},
+					Metadata: writev2.Metadata{
+						Type: writev2.Metadata_METRIC_TYPE_UNSPECIFIED,
+					},
+					Samples: []writev2.Sample{{Timestamp: 1000, Value: 7}},
+				},
+			}
+			payload, _, _, _, err := buildV2WriteRequest(promslog.NewNopLogger(), ts, symbols, nil, nil, nil, "snappy")
+			require.NoError(t, err)
+
+			req, err := http.NewRequest(http.MethodPost, "", bytes.NewReader(payload))
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", remoteWriteContentTypeHeaders[remoteapi.WriteV2MessageType])
+			req.Header.Set("Content-Encoding", compression.Snappy)
+
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			require.Equal(t, http.StatusNoContent, recorder.Result().StatusCode)
+
+			require.Len(t, appendable.samples, 3)
+			require.Len(t, appendable.metadata, 2)
+			require.Equal(t, metadata.Metadata{
+				Type: model.MetricTypeCounter,
+				Unit: "requests",
+				Help: "Total HTTP requests",
+			}, appendable.metadata[0].m)
+			require.Equal(t, metadata.Metadata{
+				Type: model.MetricTypeGauge,
+				Unit: "seconds",
+				Help: "Latency help",
+			}, appendable.metadata[1].m)
+
+			if enableTypeAndUnitLabels {
+				testutil.RequireEqual(t, labels.FromStrings("__name__", "http_requests_total", "__type__", "counter", "__unit__", "requests", "job", "api"), appendable.samples[0].l)
+				testutil.RequireEqual(t, labels.FromStrings("__name__", "latency_seconds", "__type__", "gauge", "__unit__", "seconds", "job", "api"), appendable.samples[1].l)
+			} else {
+				testutil.RequireEqual(t, labels.FromStrings("__name__", "http_requests_total", "job", "api"), appendable.samples[0].l)
+				testutil.RequireEqual(t, labels.FromStrings("__name__", "latency_seconds", "job", "api"), appendable.samples[1].l)
+			}
+			testutil.RequireEqual(t, labels.FromStrings("__name__", "untyped_metric", "job", "api"), appendable.samples[2].l)
+		})
+	}
 }

@@ -475,10 +475,11 @@ type QueueManager struct {
 	mcfg                    config.MetadataConfig
 	externalLabels          []labels.Label
 	relabelConfigs          []*relabel.Config
-	sendExemplars           bool
-	sendNativeHistograms    bool
-	enableTypeAndUnitLabels bool
-	failedRequestLogging    bool
+	sendExemplars            bool
+	sendNativeHistograms     bool
+	enableTypeAndUnitLabels  bool
+	enableMetadataRelabeling bool
+	failedRequestLogging     bool
 	convertNHCBToClassic    bool
 	watcher                 *wlog.Watcher
 	metadataWatcher         *MetadataWatcher
@@ -489,9 +490,11 @@ type QueueManager struct {
 	mode        remoteapi.WriteMode
 	compr       compression.Type
 
-	seriesMtx        sync.Mutex // Covers seriesLabels, seriesMetadata, droppedSeries, the NHCB fields and builder.
-	seriesLabels     map[chunks.HeadSeriesRef]labels.Labels
-	seriesMetadata   map[chunks.HeadSeriesRef]unique.Handle[metadata.Metadata]
+	seriesMtx         sync.Mutex // Covers seriesLabels, rawSeriesLabels, rawSeriesMetadata, seriesMetadata, droppedSeries, the NHCB fields and builder.
+	seriesLabels      map[chunks.HeadSeriesRef]labels.Labels
+	rawSeriesLabels   map[chunks.HeadSeriesRef]labels.Labels
+	rawSeriesMetadata map[chunks.HeadSeriesRef]metadata.Metadata
+	seriesMetadata    map[chunks.HeadSeriesRef]unique.Handle[metadata.Metadata]
 	droppedSeries    map[chunks.HeadSeriesRef]struct{}
 	nhcbSeriesBounds map[chunks.HeadSeriesRef]*nhcbLayout // Layout of each converted NHCB series.
 	nhcbLayouts      map[string]*nhcbLayout               // Keyed by the encoded bounds.
@@ -570,6 +573,8 @@ func NewQueueManager(
 		failedRequestLogging:    failedRequestLogging,
 
 		seriesLabels:         make(map[chunks.HeadSeriesRef]labels.Labels),
+		rawSeriesLabels:      make(map[chunks.HeadSeriesRef]labels.Labels),
+		rawSeriesMetadata:    make(map[chunks.HeadSeriesRef]metadata.Metadata),
 		seriesMetadata:       make(map[chunks.HeadSeriesRef]unique.Handle[metadata.Metadata]),
 		seriesSegmentIndexes: make(map[chunks.HeadSeriesRef]int),
 		droppedSeries:        make(map[chunks.HeadSeriesRef]struct{}),
@@ -1450,19 +1455,60 @@ func (t *QueueManager) StoreSeries(series []record.RefSeries, index int) {
 	defer t.seriesMtx.Unlock()
 	t.seriesSegmentMtx.Lock()
 	defer t.seriesSegmentMtx.Unlock()
+	useMetaRelabel := t.enableMetadataRelabeling && t.protoMsg != remoteapi.WriteV1MessageType && relabel.UsesMetadata(t.relabelConfigs...)
 	for _, s := range series {
 		// Just make sure all the Refs of Series will insert into seriesSegmentIndexes map for tracking.
 		t.seriesSegmentIndexes[s.Ref] = index
-
-		t.builder.Reset(s.Labels)
-		processExternalLabels(t.builder, t.externalLabels)
-		keep := relabel.ProcessBuilder(t.builder, t.relabelConfigs...)
-		if !keep {
-			t.droppedSeries[s.Ref] = struct{}{}
+		if !useMetaRelabel {
+			t.builder.Reset(s.Labels)
+			processExternalLabels(t.builder, t.externalLabels)
+			keep := relabel.ProcessBuilder(t.builder, t.relabelConfigs...)
+			if !keep {
+				t.droppedSeries[s.Ref] = struct{}{}
+				continue
+			}
+			t.seriesLabels[s.Ref] = t.builder.Labels()
 			continue
 		}
-		lbls := t.builder.Labels()
-		t.seriesLabels[s.Ref] = lbls
+		t.rawSeriesLabels[s.Ref] = s.Labels
+
+		meta, hasMetadataRecord := t.rawSeriesMetadata[s.Ref]
+		sm := schema.NewMetadataFromLabels(s.Labels)
+		if (meta.Type == "" || meta.Type == model.MetricTypeUnknown) && !sm.IsTypeEmpty() {
+			meta.Type = sm.Type
+		}
+		if meta.Unit == "" && sm.Unit != "" {
+			meta.Unit = sm.Unit
+		}
+
+		t.relabelSeriesLocked(s.Ref, s.Labels, meta, hasMetadataRecord)
+	}
+}
+
+func (t *QueueManager) relabelSeriesLocked(ref chunks.HeadSeriesRef, rawLabels labels.Labels, meta metadata.Metadata, hasMetadataRecord bool) {
+	t.builder.Reset(rawLabels)
+	processExternalLabels(t.builder, t.externalLabels)
+	keep := relabel.ProcessBuilderWithMetadata(t.builder, &meta, t.relabelConfigs...)
+	if !keep {
+		delete(t.seriesLabels, ref)
+		delete(t.seriesMetadata, ref)
+		t.droppedSeries[ref] = struct{}{}
+		return
+	}
+	delete(t.droppedSeries, ref)
+	if t.enableTypeAndUnitLabels {
+		schema.Metadata{
+			Name: t.builder.Get(model.MetricNameLabel),
+			Type: meta.Type,
+			Unit: meta.Unit,
+		}.SetToLabels(t.builder)
+	} else {
+		t.builder.Del(model.MetricTypeLabel)
+		t.builder.Del(model.MetricUnitLabel)
+	}
+	t.seriesLabels[ref] = t.builder.Labels()
+	if t.protoMsg != remoteapi.WriteV1MessageType && (hasMetadataRecord || !meta.IsEmpty()) {
+		t.seriesMetadata[ref] = unique.Make(meta)
 	}
 }
 
@@ -1474,12 +1520,28 @@ func (t *QueueManager) StoreMetadata(meta []record.RefMetadata) {
 
 	t.seriesMtx.Lock()
 	defer t.seriesMtx.Unlock()
+	useMetaRelabel := t.enableMetadataRelabeling && relabel.UsesMetadata(t.relabelConfigs...)
 	for _, m := range meta {
-		t.seriesMetadata[m.Ref] = unique.Make(metadata.Metadata{
+		md := metadata.Metadata{
 			Type: record.ToMetricType(m.Type),
 			Unit: m.Unit,
 			Help: m.Help,
-		})
+		}
+		if useMetaRelabel {
+			t.rawSeriesMetadata[m.Ref] = md
+			if rawLabels, ok := t.rawSeriesLabels[m.Ref]; ok {
+				sm := schema.NewMetadataFromLabels(rawLabels)
+				if md.Type == model.MetricTypeUnknown && !sm.IsTypeEmpty() {
+					md.Type = sm.Type
+				}
+				if md.Unit == "" && sm.Unit != "" {
+					md.Unit = sm.Unit
+				}
+				t.relabelSeriesLocked(m.Ref, rawLabels, md, true)
+				continue
+			}
+		}
+		t.seriesMetadata[m.Ref] = unique.Make(md)
 	}
 }
 
@@ -1509,6 +1571,8 @@ func (t *QueueManager) SeriesReset(index int) {
 		}
 		delete(t.seriesSegmentIndexes, k)
 		delete(t.seriesLabels, k)
+		delete(t.rawSeriesLabels, k)
+		delete(t.rawSeriesMetadata, k)
 		delete(t.seriesMetadata, k)
 		delete(t.droppedSeries, k)
 		if layout, ok := t.nhcbSeriesBounds[k]; ok {

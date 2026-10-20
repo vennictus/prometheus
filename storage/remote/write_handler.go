@@ -339,7 +339,14 @@ func (h *writeHandler) appendV2(app *timeLimitExemplarAppenderV2, req *writev2.R
 			badRequestErrs = append(badRequestErrs, fmt.Errorf("parsing metadata for series %v: %w", ts.LabelsRefs, err))
 			continue
 		}
-		if h.enableTypeAndUnitLabels && (m.Type != model.MetricTypeUnknown || m.Unit != "") {
+		schemaMeta := schema.NewMetadataFromLabels(ls)
+		if m.Type == model.MetricTypeUnknown && !schemaMeta.IsTypeEmpty() {
+			m.Type = schemaMeta.Type
+		}
+		if m.Unit == "" && schemaMeta.Unit != "" {
+			m.Unit = schemaMeta.Unit
+		}
+		if h.enableTypeAndUnitLabels && (m.Type != model.MetricTypeUnknown || m.Unit != "" || ls.Has(model.MetricTypeLabel) || ls.Has(model.MetricUnitLabel)) {
 			slb := labels.NewScratchBuilder(ls.Len() + 2) // +2 for __type__ and __unit__
 			ls.Range(func(l labels.Label) {
 				// Skip __type__ and __unit__ labels if they exist in the incoming labels.
@@ -350,6 +357,14 @@ func (h *writeHandler) appendV2(app *timeLimitExemplarAppenderV2, req *writev2.R
 			})
 			schema.Metadata{Type: m.Type, Unit: m.Unit}.AddToLabels(&slb)
 			slb.Sort()
+			ls = slb.Labels()
+		} else if !h.enableTypeAndUnitLabels && (ls.Has(model.MetricTypeLabel) || ls.Has(model.MetricUnitLabel)) {
+			slb := labels.NewScratchBuilder(ls.Len())
+			ls.Range(func(l labels.Label) {
+				if l.Name != model.MetricTypeLabel && l.Name != model.MetricUnitLabel {
+					slb.Add(l.Name, l.Value)
+				}
+			})
 			ls = slb.Labels()
 		}
 
