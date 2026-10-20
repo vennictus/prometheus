@@ -26,7 +26,12 @@ import (
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/metadata"
+	"github.com/prometheus/prometheus/schema"
 )
+
+// MetricHelpLabel is the synthetic label name used to read and mutate metric help metadata during relabeling.
+const MetricHelpLabel = "__help__"
 
 var (
 	// relabelTargetLegacy allows targeting labels with legacy Prometheus character set, plus ${<var>} variables for dynamic characters from source the metrics.
@@ -188,6 +193,12 @@ func (c *Config) Validate(nameValidationScheme model.ValidationScheme) error {
 		}
 	}
 
+	if c.Action == Replace && c.TargetLabel == model.MetricTypeLabel && !varInRegexTemplate(c.Replacement) {
+		if !schema.IsValidMetricType(model.MetricType(c.Replacement)) && c.Replacement != "" && c.Replacement != string(model.MetricTypeUnknown) {
+			return fmt.Errorf("%q is invalid 'replacement' for %s action on %s", c.Replacement, c.Action, model.MetricTypeLabel)
+		}
+	}
+
 	return nil
 }
 
@@ -272,23 +283,136 @@ func (re Regexp) String() string {
 // ProcessBuilder applies relabeling configurations (rules) to the labels in lb.
 // The rules are applied in order of input. Returns false if the rule says to drop.
 func ProcessBuilder(lb *labels.Builder, cfgs ...*Config) (keep bool) {
+	return ProcessBuilderWithMetadata(lb, nil, cfgs...)
+}
+
+// UsesMetadata returns true if any relabel configuration reads or writes
+// metric metadata (__type__, __unit__, or __help__).
+func UsesMetadata(cfgs ...*Config) bool {
 	for _, cfg := range cfgs {
-		keep = relabel(cfg, lb)
+		for _, sl := range cfg.SourceLabels {
+			if isMetadataRelabelName(string(sl)) {
+				return true
+			}
+		}
+		if isMetadataRelabelName(cfg.TargetLabel) || varInRegexTemplate(cfg.TargetLabel) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMetadataRelabelName(ln string) bool {
+	return ln == model.MetricTypeLabel || ln == model.MetricUnitLabel || ln == MetricHelpLabel
+}
+
+// ProcessBuilderWithMetadata applies relabeling configurations (rules) to the labels in lb
+// and optional metadata in meta. When meta is non-nil, __type__, __unit__, and __help__
+// are resolved from and written back to meta, while bulk label actions (labeldrop,
+// labelkeep, labelmap) only operate on lb and leave meta untouched.
+func ProcessBuilderWithMetadata(lb *labels.Builder, meta *metadata.Metadata, cfgs ...*Config) (keep bool) {
+	var syncTypeToLB, syncUnitToLB bool
+	if meta != nil {
+		syncTypeToLB = lb.Get(model.MetricTypeLabel) != ""
+		syncUnitToLB = lb.Get(model.MetricUnitLabel) != ""
+		if (meta.Type == "" || meta.Type == model.MetricTypeUnknown) && syncTypeToLB {
+			if v := lb.Get(model.MetricTypeLabel); v != string(model.MetricTypeUnknown) {
+				meta.Type = model.MetricType(v)
+			}
+		}
+		if meta.Unit == "" && syncUnitToLB {
+			meta.Unit = lb.Get(model.MetricUnitLabel)
+		}
+		if meta.Help == "" {
+			if v := lb.Get(MetricHelpLabel); v != "" {
+				meta.Help = v
+			}
+		}
+		lb.Del(MetricHelpLabel)
+	}
+	for _, cfg := range cfgs {
+		keep = relabel(cfg, lb, meta, syncTypeToLB, syncUnitToLB)
 		if !keep {
 			return false
+		}
+	}
+	if meta != nil {
+		lb.Del(MetricHelpLabel)
+		if meta.Type != "" && !schema.IsValidMetricType(meta.Type) {
+			meta.Type = model.MetricTypeUnknown
+			lb.Del(model.MetricTypeLabel)
 		}
 	}
 	return true
 }
 
-func relabel(cfg *Config, lb *labels.Builder) (keep bool) {
+func getLabelOrMeta(lb *labels.Builder, meta *metadata.Metadata, ln string) string {
+	if meta == nil {
+		return lb.Get(ln)
+	}
+	switch ln {
+	case model.MetricTypeLabel:
+		if meta.Type != "" && meta.Type != model.MetricTypeUnknown {
+			return string(meta.Type)
+		}
+		return ""
+	case model.MetricUnitLabel:
+		return meta.Unit
+	case MetricHelpLabel:
+		return meta.Help
+	default:
+		return lb.Get(ln)
+	}
+}
+
+func setLabelOrMeta(lb *labels.Builder, meta *metadata.Metadata, target, val string, syncTypeToLB, syncUnitToLB bool) {
+	if meta == nil {
+		if val == "" {
+			lb.Del(target)
+		} else {
+			lb.Set(target, val)
+		}
+		return
+	}
+	switch target {
+	case MetricHelpLabel:
+		meta.Help = val
+	case model.MetricUnitLabel:
+		meta.Unit = val
+		if syncUnitToLB {
+			if val == "" {
+				lb.Del(model.MetricUnitLabel)
+			} else {
+				lb.Set(model.MetricUnitLabel, val)
+			}
+		}
+	case model.MetricTypeLabel:
+		if val == "" || val == string(model.MetricTypeUnknown) {
+			meta.Type = model.MetricTypeUnknown
+			lb.Del(model.MetricTypeLabel)
+		} else {
+			meta.Type = model.MetricType(val)
+			if syncTypeToLB {
+				lb.Set(model.MetricTypeLabel, val)
+			}
+		}
+	default:
+		if val == "" {
+			lb.Del(target)
+		} else {
+			lb.Set(target, val)
+		}
+	}
+}
+
+func relabel(cfg *Config, lb *labels.Builder, meta *metadata.Metadata, syncTypeToLB, syncUnitToLB bool) (keep bool) {
 	var va [16]string
 	values := va[:0]
 	if len(cfg.SourceLabels) > cap(values) {
 		values = make([]string, 0, len(cfg.SourceLabels))
 	}
 	for _, ln := range cfg.SourceLabels {
-		values = append(values, lb.Get(string(ln)))
+		values = append(values, getLabelOrMeta(lb, meta, string(ln)))
 	}
 	val := strings.Join(values, cfg.Separator)
 
@@ -302,18 +426,18 @@ func relabel(cfg *Config, lb *labels.Builder) (keep bool) {
 			return false
 		}
 	case DropEqual:
-		if lb.Get(cfg.TargetLabel) == val {
+		if getLabelOrMeta(lb, meta, cfg.TargetLabel) == val {
 			return false
 		}
 	case KeepEqual:
-		if lb.Get(cfg.TargetLabel) != val {
+		if getLabelOrMeta(lb, meta, cfg.TargetLabel) != val {
 			return false
 		}
 	case Replace:
 		// Fast path to add or delete label pair.
 		if val == "" && cfg.Regex == DefaultRelabelConfig.Regex &&
 			!varInRegexTemplate(cfg.TargetLabel) && !varInRegexTemplate(cfg.Replacement) {
-			lb.Set(cfg.TargetLabel, cfg.Replacement)
+			setLabelOrMeta(lb, meta, cfg.TargetLabel, cfg.Replacement, syncTypeToLB, syncUnitToLB)
 			break
 		}
 
@@ -328,24 +452,24 @@ func relabel(cfg *Config, lb *labels.Builder) (keep bool) {
 		}
 		res := cfg.Regex.ExpandString([]byte{}, cfg.Replacement, val, indexes)
 		if len(res) == 0 {
-			lb.Del(target)
+			setLabelOrMeta(lb, meta, target, "", syncTypeToLB, syncUnitToLB)
 			break
 		}
-		lb.Set(target, string(res))
+		setLabelOrMeta(lb, meta, target, string(res), syncTypeToLB, syncUnitToLB)
 	case Lowercase:
-		lb.Set(cfg.TargetLabel, strings.ToLower(val))
+		setLabelOrMeta(lb, meta, cfg.TargetLabel, strings.ToLower(val), syncTypeToLB, syncUnitToLB)
 	case Uppercase:
-		lb.Set(cfg.TargetLabel, strings.ToUpper(val))
+		setLabelOrMeta(lb, meta, cfg.TargetLabel, strings.ToUpper(val), syncTypeToLB, syncUnitToLB)
 	case HashMod:
 		hash := md5.Sum([]byte(val))
 		// Use only the last 8 bytes of the hash to give the same result as earlier versions of this code.
 		mod := binary.BigEndian.Uint64(hash[8:]) % cfg.Modulus
-		lb.Set(cfg.TargetLabel, strconv.FormatUint(mod, 10))
+		setLabelOrMeta(lb, meta, cfg.TargetLabel, strconv.FormatUint(mod, 10), syncTypeToLB, syncUnitToLB)
 	case LabelMap:
 		lb.Range(func(l labels.Label) {
 			if cfg.Regex.MatchString(l.Name) {
 				res := cfg.Regex.ReplaceAllString(l.Name, cfg.Replacement)
-				lb.Set(res, l.Value)
+				setLabelOrMeta(lb, meta, res, l.Value, syncTypeToLB, syncUnitToLB)
 			}
 		})
 	case LabelDrop:
