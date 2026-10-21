@@ -271,14 +271,14 @@ loop:
 				}
 			}
 		} else {
-			if sl.cache.getDropped(met) {
-				continue
-			}
-			ce, seriesCached, seriesAlreadyScraped = sl.cache.get(met)
 			if lastMeta != nil {
 				origMeta = lastMeta.Metadata
 				origMFName = yoloString(lastMFName)
 			}
+			if sl.cache.getDroppedWithMeta(met, origMFName, origMeta) {
+				continue
+			}
+			ce, seriesCached, seriesAlreadyScraped = sl.cache.get(met)
 			var (
 				sm            seriesMetaEntry
 				hasCachedMeta bool
@@ -308,7 +308,7 @@ loop:
 					if seriesCached {
 						sl.cache.deleteSeries(met, ce)
 					}
-					sl.cache.addDropped(met)
+					sl.cache.addDroppedWithMeta(met, origMFName, origMeta)
 					continue
 				}
 
@@ -698,11 +698,33 @@ func (sl *scrapeLoop) mutateSample(lset labels.Labels, lastMFName []byte, lastMe
 		sampleMeta = metadata.Metadata{Type: model.MetricTypeUnknown}
 	}
 
-	lset = sl.sampleMutator(lset)
-	if lset.IsEmpty() || !hasFamilyMeta {
+	if sl.sampleMutatorWithMetadata != nil {
+		lset, sampleMeta = sl.sampleMutatorWithMetadata(lset, sampleMeta)
+		if !hasFamilyMeta && lastMeta != nil && isSeriesPartOfFamily(preName, lastMFName, sampleMeta.Type) {
+			hasFamilyMeta = true
+			if sampleMeta.Help == "" {
+				sampleMeta.Help = lastMeta.Help
+			}
+			if sampleMeta.Unit == "" && lastMeta.Unit != "" {
+				sampleMeta.Unit = lastMeta.Unit
+				if sl.enableTypeAndUnitLabels {
+					lb := labels.NewBuilder(lset)
+					lb.Set(model.MetricUnitLabel, sampleMeta.Unit)
+					lset = lb.Labels()
+				}
+			}
+		}
+	} else if sl.sampleMutator != nil {
+		lset = sl.sampleMutator(lset)
+	}
+	if lset.IsEmpty() || (!hasFamilyMeta && sampleMeta.IsEmpty()) {
 		return lset, metadata.Metadata{}, ""
 	}
 
-	postMFName := metricFamilyName(preName, lastMFName, lset.Get(model.MetricNameLabel), sampleMeta.Type)
+	var preMF []byte
+	if hasFamilyMeta {
+		preMF = lastMFName
+	}
+	postMFName := metricFamilyName(preName, preMF, lset.Get(model.MetricNameLabel), sampleMeta.Type)
 	return lset, sampleMeta, postMFName
 }

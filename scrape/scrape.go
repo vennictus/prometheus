@@ -57,6 +57,7 @@ import (
 	"github.com/prometheus/prometheus/model/textparse"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/model/value"
+	"github.com/prometheus/prometheus/schema"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/logging"
 	"github.com/prometheus/prometheus/util/pool"
@@ -131,6 +132,10 @@ const maxAheadTime = 10 * time.Minute
 
 // returning an empty label set is interpreted as "drop".
 type labelsMutator func(labels.Labels) labels.Labels
+
+// labelsAndMetadataMutator mutates both the label set and metadata of a scraped sample.
+// Returning an empty label set is interpreted as "drop".
+type labelsAndMetadataMutator func(labels.Labels, metadata.Metadata) (labels.Labels, metadata.Metadata)
 
 // scrapeLoopAppendAdapter allows support for multiple storage.Appender versions.
 type scrapeLoopAppendAdapter interface {
@@ -649,7 +654,39 @@ func verifyLabelLimits(lset labels.Labels, limits *labelLimits) error {
 
 func mutateSampleLabels(lset labels.Labels, target *Target, honor bool, rc []*relabel.Config) labels.Labels {
 	lb := labels.NewBuilder(lset)
+	applyTargetLabels(lb, lset, target, honor)
+	if keep := relabel.ProcessBuilder(lb, rc...); !keep {
+		return labels.EmptyLabels()
+	}
+	return lb.Labels()
+}
 
+func mutateSampleLabelsAndMetadata(lset labels.Labels, meta metadata.Metadata, target *Target, honor, enableTypeAndUnitLabels bool, rc []*relabel.Config) (labels.Labels, metadata.Metadata) {
+	lb := labels.NewBuilder(lset)
+	if enableTypeAndUnitLabels {
+		// Strip parser-injected __type__ and __unit__ before relabeling so an untyped/unitless
+		// series does not inherit a preceding family's sticky parser state.
+		lb.Del(model.MetricTypeLabel)
+		lb.Del(model.MetricUnitLabel)
+	}
+	applyTargetLabels(lb, lset, target, honor)
+	if keep := relabel.ProcessBuilderWithMetadata(lb, &meta, rc...); !keep {
+		return labels.EmptyLabels(), metadata.Metadata{}
+	}
+	if enableTypeAndUnitLabels {
+		schema.Metadata{
+			Name: lb.Get(model.MetricNameLabel),
+			Type: meta.Type,
+			Unit: meta.Unit,
+		}.SetToLabels(lb)
+	} else {
+		lb.Del(model.MetricTypeLabel)
+		lb.Del(model.MetricUnitLabel)
+	}
+	return lb.Labels(), meta
+}
+
+func applyTargetLabels(lb *labels.Builder, lset labels.Labels, target *Target, honor bool) {
 	if honor {
 		target.LabelsRange(func(l labels.Label) {
 			if !lset.Has(l.Name) {
@@ -671,12 +708,6 @@ func mutateSampleLabels(lset labels.Labels, target *Target, honor bool, rc []*re
 			resolveConflictingExposedLabels(lb, conflictingExposedLabels)
 		}
 	}
-
-	if keep := relabel.ProcessBuilder(lb, rc...); !keep {
-		return labels.EmptyLabels()
-	}
-
-	return lb.Labels()
 }
 
 func resolveConflictingExposedLabels(lb *labels.Builder, conflictingExposedLabels []labels.Label) {
@@ -952,11 +983,12 @@ type scrapeLoop struct {
 	l           *slog.Logger
 	cache       *scrapeCache
 
-	interval            time.Duration
-	timeout             time.Duration
-	sampleMutator       labelsMutator
-	reportSampleMutator labelsMutator
-	scraper             scraper
+	interval                  time.Duration
+	timeout                   time.Duration
+	sampleMutator             labelsMutator
+	sampleMutatorWithMetadata labelsAndMetadataMutator
+	reportSampleMutator       labelsMutator
+	scraper                   scraper
 
 	// Static params per scrapePool.
 	appendable   storage.Appendable
@@ -1031,7 +1063,8 @@ type scrapeCache struct {
 	seriesPrev map[storage.SeriesRef]*cacheEntry
 
 	// Per-series post-relabel metadata cache, lazily allocated only when metric_relabel_configs is non-empty.
-	seriesMeta map[*cacheEntry]seriesMetaEntry
+	seriesMeta        map[*cacheEntry]seriesMetaEntry
+	droppedSeriesMeta map[string]seriesMetaEntry
 
 	// TODO(bwplotka): Consider moving metadata caching to head. See
 	// https://github.com/prometheus/prometheus/issues/17619.
@@ -1101,6 +1134,9 @@ func (c *scrapeCache) iterDone(flushCache bool) {
 		for s, iter := range c.droppedSeries {
 			if c.iter != *iter {
 				delete(c.droppedSeries, s)
+				if c.droppedSeriesMeta != nil {
+					delete(c.droppedSeriesMeta, s)
+				}
 			}
 		}
 		c.metaMtx.Lock()
@@ -1172,12 +1208,39 @@ func (c *scrapeCache) addDropped(met []byte) {
 	c.droppedSeries[string(met)] = &iter
 }
 
+func (c *scrapeCache) addDroppedWithMeta(met []byte, origMFName string, origMeta metadata.Metadata) {
+	c.addDropped(met)
+	if c.droppedSeriesMeta == nil {
+		c.droppedSeriesMeta = make(map[string]seriesMetaEntry)
+	}
+	c.droppedSeriesMeta[string(met)] = seriesMetaEntry{
+		origMFName: strings.Clone(origMFName),
+		origMeta:   origMeta,
+	}
+}
+
 func (c *scrapeCache) getDropped(met []byte) bool {
 	iterp, ok := c.droppedSeries[string(met)]
 	if ok {
 		*iterp = c.iter
 	}
 	return ok
+}
+
+func (c *scrapeCache) getDroppedWithMeta(met []byte, origMFName string, origMeta metadata.Metadata) bool {
+	iterp, ok := c.droppedSeries[string(met)]
+	if !ok {
+		return false
+	}
+	if c.droppedSeriesMeta != nil {
+		if dm, hasMeta := c.droppedSeriesMeta[string(met)]; hasMeta && (dm.origMFName != origMFName || !dm.origMeta.Equals(origMeta)) {
+			delete(c.droppedSeries, string(met))
+			delete(c.droppedSeriesMeta, string(met))
+			return false
+		}
+	}
+	*iterp = c.iter
+	return true
 }
 
 // updateRef points the cache entry at a new storage reference, e.g. because the
@@ -1292,6 +1355,9 @@ func (c *scrapeCache) setMetadata(mfName string, m metadata.Metadata) {
 	defer c.metaMtx.Unlock()
 
 	e, ok := c.metadata[mfName]
+	if !ok && m.IsEmpty() {
+		return
+	}
 	var oldSize int
 	if !ok {
 		e = &metaEntry{Metadata: metadata.Metadata{Type: model.MetricTypeUnknown}}
@@ -1385,6 +1451,13 @@ func newScrapeLoop(opts scrapeLoopOptions) *scrapeLoop {
 		appenderCtx = ContextWithTarget(appenderCtx, opts.target)
 	}
 
+	var sampleMutatorWithMetadata labelsAndMetadataMutator
+	if opts.sp.options.EnableMetadataRelabeling {
+		sampleMutatorWithMetadata = func(l labels.Labels, m metadata.Metadata) (labels.Labels, metadata.Metadata) {
+			return mutateSampleLabelsAndMetadata(l, m, opts.target, opts.sp.config.HonorLabels, opts.sp.options.EnableTypeAndUnitLabels, opts.sp.config.MetricRelabelConfigs)
+		}
+	}
+
 	ctx, cancel := context.WithCancel(opts.sp.ctx)
 	return &scrapeLoop{
 		ctx:         ctx,
@@ -1400,6 +1473,7 @@ func newScrapeLoop(opts scrapeLoopOptions) *scrapeLoop {
 		sampleMutator: func(l labels.Labels) labels.Labels {
 			return mutateSampleLabels(l, opts.target, opts.sp.config.HonorLabels, opts.sp.config.MetricRelabelConfigs)
 		},
+		sampleMutatorWithMetadata: sampleMutatorWithMetadata,
 		reportSampleMutator: func(l labels.Labels) labels.Labels { return mutateReportSampleLabels(l, opts.target) },
 		scraper:             opts.scraper,
 
