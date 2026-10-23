@@ -475,7 +475,7 @@ func TestNewFileReaderErrorNoOpenFiles(t *testing.T) {
 }
 
 func TestSymbols(t *testing.T) {
-	for _, version := range []int{FormatV2, FormatV3} {
+	for _, version := range []int{FormatV1, FormatV2, FormatV3} {
 		t.Run(fmt.Sprintf("format=%d", version), func(t *testing.T) {
 			buf := encoding.Encbuf{}
 
@@ -485,8 +485,14 @@ func TestSymbols(t *testing.T) {
 			symbolsStart := buf.Len()
 			buf.PutBE32int(204) // Length of symbols table.
 			buf.PutBE32int(100) // Number of symbols.
+			symbolOffsets := make([]uint32, 100)
 			for i := range 100 {
 				// i represents index in unicode characters table.
+				if version == FormatV1 {
+					symbolOffsets[i] = uint32(buf.Len())
+				} else {
+					symbolOffsets[i] = uint32(i)
+				}
 				buf.PutUvarintStr(string(rune(i))) // Symbol.
 			}
 			checksum := crc32.Checksum(buf.Get()[symbolsStart+4:], castagnoliTable)
@@ -494,22 +500,31 @@ func TestSymbols(t *testing.T) {
 
 			s, err := NewSymbols(realByteSlice(buf.Get()), version, symbolsStart)
 			require.NoError(t, err)
-			require.Equal(t, 100*2, s.Size())
+			if version == FormatV1 {
+				require.Equal(t, 32, s.Size())
+			} else {
+				require.Equal(t, 100*2, s.Size())
+			}
 
 			for i := 99; i >= 0; i-- {
-				got, err := s.Lookup(uint32(i))
+				got, err := s.Lookup(symbolOffsets[i])
 				require.NoError(t, err)
 				require.Equal(t, string(rune(i)), got)
 			}
-			_, err = s.Lookup(100)
-			require.Error(t, err)
-			_, err = s.Lookup(^uint32(0))
-			require.Error(t, err)
+			if version == FormatV1 {
+				_, err = s.Lookup(uint32(buf.Len()))
+				require.Error(t, err)
+			} else {
+				_, err = s.Lookup(100)
+				require.Error(t, err)
+				_, err = s.Lookup(^uint32(0))
+				require.Error(t, err)
+			}
 
 			for i := 99; i >= 0; i-- {
 				r, err := s.ReverseLookup(string(rune(i)))
 				require.NoError(t, err)
-				require.Equal(t, uint32(i), r)
+				require.Equal(t, symbolOffsets[i], r)
 			}
 			_, err = s.ReverseLookup(string(rune(100)))
 			require.Error(t, err)
@@ -523,7 +538,7 @@ func TestSymbols(t *testing.T) {
 			require.NoError(t, iter.Err())
 
 			t.Run("offset above signed 16-bit range", func(t *testing.T) {
-				// The fourth offset has its high bit set in the final lane of its word.
+				// The fourth symbol's byte position is above the signed 16-bit range.
 				symbols := []string{
 					"a",
 					strings.Repeat("b", 20_000),
@@ -533,7 +548,13 @@ func TestSymbols(t *testing.T) {
 				}
 				var symbolData encoding.Encbuf
 				symbolData.PutBE32int(len(symbols))
-				for _, symbol := range symbols {
+				symbolOffsets := make([]uint32, len(symbols))
+				for i, symbol := range symbols {
+					if version == FormatV1 {
+						symbolOffsets[i] = uint32(4 + symbolData.Len())
+					} else {
+						symbolOffsets[i] = uint32(i)
+					}
 					symbolData.PutUvarintStr(symbol)
 				}
 				var symbolFile encoding.Encbuf
@@ -543,14 +564,14 @@ func TestSymbols(t *testing.T) {
 
 				gotSymbols, err := NewSymbols(realByteSlice(symbolFile.Get()), version, 0)
 				require.NoError(t, err)
-				require.True(t, gotSymbols.direct)
-				require.Greater(t, gotSymbols.directOffset(3), 1<<15)
-				got, err := gotSymbols.Lookup(3)
-				require.NoError(t, err)
-				require.Equal(t, symbols[3], got)
-				offset, err := gotSymbols.ReverseLookup(symbols[3])
-				require.NoError(t, err)
-				require.Equal(t, uint32(3), offset)
+				for i, symbol := range symbols {
+					got, err := gotSymbols.Lookup(symbolOffsets[i])
+					require.NoError(t, err)
+					require.Equal(t, symbol, got)
+					offset, err := gotSymbols.ReverseLookup(symbol)
+					require.NoError(t, err)
+					require.Equal(t, symbolOffsets[i], offset)
+				}
 			})
 		})
 	}

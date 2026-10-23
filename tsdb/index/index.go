@@ -27,7 +27,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"strconv"
 	"unsafe"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -1154,14 +1153,15 @@ func (r *Reader) PostingsRanges() (map[labels.Label]Range, error) {
 }
 
 type Symbols struct {
-	bs   ByteSlice
-	off  int
-	seen int
+	bs      ByteSlice
+	off     int
+	seen    int
+	version int
 
-	// Offsets contain sparse checkpoints or packed direct positions.
+	// Offsets contain sparse symbol checkpoints.
 	offsets []int
-	v1      bool
-	direct  bool
+	// Direct offsets map symbol ordinals to byte positions in small symbol tables.
+	directOffsets []uint16
 }
 
 const symbolFactor = 32
@@ -1169,9 +1169,9 @@ const symbolFactor = 32
 // NewSymbols returns a Symbols object for symbol lookups.
 func NewSymbols(bs ByteSlice, version, off int) (*Symbols, error) {
 	s := &Symbols{
-		bs:  bs,
-		off: off,
-		v1:  version == FormatV1,
+		bs:      bs,
+		off:     off,
+		version: version,
 	}
 	d := encoding.NewDecbufAt(bs, off, castagnoliTable)
 	origLen := d.Len()
@@ -1185,17 +1185,16 @@ func NewSymbols(bs ByteSlice, version, off int) (*Symbols, error) {
 	}
 
 	// Keep larger tables sparse to avoid a per-symbol retained offset.
-	s.direct = !s.v1 && origLen <= math.MaxUint16
-	if s.direct {
-		valuesPerWord := strconv.IntSize / 16
-		s.offsets = make([]int, 0, (cnt+valuesPerWord-1)/valuesPerWord)
+	direct := s.version != FormatV1 && origLen <= math.MaxUint16
+	if direct {
+		s.directOffsets = make([]uint16, 0, cnt)
 	} else {
 		s.offsets = make([]int, 0, 1+cnt/symbolFactor)
 	}
 	for d.Err() == nil && s.seen < cnt {
 		position := origLen - d.Len()
-		if s.direct {
-			s.appendDirectOffset(uint16(position))
+		if direct {
+			s.directOffsets = append(s.directOffsets, uint16(position))
 		} else if s.seen%symbolFactor == 0 {
 			s.offsets = append(s.offsets, off+4+position)
 		}
@@ -1213,14 +1212,14 @@ func (s Symbols) Lookup(o uint32) (string, error) {
 		B: s.bs.Range(0, s.bs.Len()),
 	}
 
-	if s.v1 {
+	if s.version == FormatV1 {
 		d.Skip(int(o))
 	} else {
 		if uint64(o) >= uint64(s.seen) {
 			return "", fmt.Errorf("unknown symbol offset %d", o)
 		}
-		if s.direct {
-			d.Skip(s.off + 4 + s.directOffset(int(o)))
+		if s.directOffsets != nil {
+			d.Skip(s.off + 4 + int(s.directOffsets[int(o)]))
 		} else {
 			d.Skip(s.offsets[int(o/symbolFactor)])
 			// Walk until we find the one we want.
@@ -1237,20 +1236,20 @@ func (s Symbols) Lookup(o uint32) (string, error) {
 }
 
 func (s Symbols) ReverseLookup(sym string) (uint32, error) {
-	checkpoints := len(s.offsets)
-	if s.direct {
-		checkpoints = (s.seen + symbolFactor - 1) / symbolFactor
+	numOffsets := len(s.offsets)
+	if s.directOffsets != nil {
+		numOffsets = (s.seen + symbolFactor - 1) / symbolFactor
 	}
-	if checkpoints == 0 {
+	if numOffsets == 0 {
 		return 0, fmt.Errorf("unknown symbol %q - no symbols", sym)
 	}
 	offsetAt := func(i int) int {
-		if s.direct {
-			return s.off + 4 + s.directOffset(i*symbolFactor)
+		if s.directOffsets != nil {
+			return s.off + 4 + int(s.directOffsets[i*symbolFactor])
 		}
 		return s.offsets[i]
 	}
-	i := sort.Search(checkpoints, func(i int) bool {
+	i := sort.Search(numOffsets, func(i int) bool {
 		// Any decoding errors here will be lost, however
 		// we already read through all of this at startup.
 		d := encoding.Decbuf{
@@ -1283,32 +1282,16 @@ func (s Symbols) ReverseLookup(sym string) (uint32, error) {
 	if lastSymbol != sym {
 		return 0, fmt.Errorf("unknown symbol %q", sym)
 	}
-	if s.v1 {
+	if s.version == FormatV1 {
 		return uint32(s.bs.Len() - lastLen), nil
 	}
 	return uint32(res), nil
 }
 
-func (s *Symbols) appendDirectOffset(position uint16) {
-	valuesPerWord := strconv.IntSize / 16
-	shift := uint((s.seen % valuesPerWord) * 16)
-	if shift == 0 {
-		s.offsets = append(s.offsets, int(position))
-		return
-	}
-	s.offsets[len(s.offsets)-1] |= int(uint(position) << shift)
-}
-
-func (s Symbols) directOffset(i int) int {
-	valuesPerWord := strconv.IntSize / 16
-	shift := uint((i % valuesPerWord) * 16)
-	return int(uint16(uint(s.offsets[i/valuesPerWord]) >> shift))
-}
-
 // Size returns the symbol-offset size used by reader memory accounting, in bytes.
 func (s Symbols) Size() int {
-	if s.direct {
-		return len(s.offsets) * (strconv.IntSize / 8)
+	if s.directOffsets != nil {
+		return len(s.directOffsets) * 2
 	}
 	return len(s.offsets) * 8
 }
